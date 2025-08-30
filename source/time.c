@@ -1,3 +1,13 @@
+/* This file takes care of those system calls that deal with time.
+ *
+ * The entry points into this file are
+ *   do_getres:		perform the CLOCK_GETRES system call
+ *   do_gettime:	perform the CLOCK_GETTIME system call
+ *   do_settime:	perform the CLOCK_SETTIME system call
+ *   do_time:		perform the GETTIMEOFDAY system call
+ *   do_stime:		perform the STIME system call
+ */
+
 #include "pm.h"
 #include <minix/callnr.h>
 #include <minix/com.h>
@@ -5,73 +15,117 @@
 #include <sys/time.h>
 #include "mproc.h"
 
-int do_gettime(void)
+/*===========================================================================*
+ *				do_gettime				     *
+ *===========================================================================*/
+int
+do_gettime(void)
 {
-  clock_t ticks, realtime;
+  clock_t ticks, realtime, clock;
   time_t boottime;
+  int s;
 
-  if (getuptime(&ticks, &realtime, &boottime) != OK)
-      panic("do_gettime couldn't get uptime");
+  if ( (s=getuptime(&ticks, &realtime, &boottime)) != OK)
+  	panic("do_time couldn't get uptime: %d", s);
 
-  if (m_in.m_lc_pm_time.clk_id == CLOCK_REALTIME) {
-      ticks = realtime;
-  } else if (m_in.m_lc_pm_time.clk_id != CLOCK_MONOTONIC) {
-      return EINVAL;
+  switch (m_in.m_lc_pm_time.clk_id) {
+	case CLOCK_REALTIME:
+		clock = realtime;
+		break;
+	case CLOCK_MONOTONIC:
+		clock = ticks;
+		break;
+	default:
+		return EINVAL; /* invalid/unsupported clock_id */
   }
 
-  mp->mp_reply.m_pm_lc_time.sec = boottime + (ticks / system_hz);
-  mp->mp_reply.m_pm_lc_time.nsec = (uint32_t) ((ticks % system_hz) * 1000000000ULL / system_hz);
+  mp->mp_reply.m_pm_lc_time.sec = boottime + (clock / system_hz);
+  mp->mp_reply.m_pm_lc_time.nsec =
+	(uint32_t) ((clock % system_hz) * 1000000000ULL / system_hz);
 
-  return OK;
+  return(OK);
 }
 
-int do_getres(void)
+/*===========================================================================*
+ *				do_getres				     *
+ *===========================================================================*/
+int
+do_getres(void)
 {
-  if (m_in.m_lc_pm_time.clk_id != CLOCK_REALTIME && m_in.m_lc_pm_time.clk_id != CLOCK_MONOTONIC)
-      return EINVAL;
-
-  mp->mp_reply.m_pm_lc_time.sec = 0;
-  mp->mp_reply.m_pm_lc_time.nsec = 1000000000 / system_hz;
-  return OK;
+  switch (m_in.m_lc_pm_time.clk_id) {
+	case CLOCK_REALTIME:
+	case CLOCK_MONOTONIC:
+		/* tv_sec is always 0 since system_hz is an int */
+		mp->mp_reply.m_pm_lc_time.sec = 0;
+		mp->mp_reply.m_pm_lc_time.nsec = 1000000000 / system_hz;
+		return(OK);
+	default:
+		return EINVAL; /* invalid/unsupported clock_id */
+  }
 }
 
-int do_settime(void)
+/*===========================================================================*
+ *				do_settime				     *
+ *===========================================================================*/
+int
+do_settime(void)
 {
-  if (mp->mp_effuid != SUPER_USER)
-      return EPERM;
+  int s;
 
-  if (m_in.m_lc_pm_time.clk_id == CLOCK_REALTIME)
-      return sys_settime(m_in.m_lc_pm_time.now, m_in.m_lc_pm_time.clk_id, m_in.m_lc_pm_time.sec, m_in.m_lc_pm_time.nsec);
+  if (mp->mp_effuid != SUPER_USER) {
+      return(EPERM);
+  }
 
-  return EINVAL;
+  switch (m_in.m_lc_pm_time.clk_id) {
+	case CLOCK_REALTIME:
+		s = sys_settime(m_in.m_lc_pm_time.now, m_in.m_lc_pm_time.clk_id,
+			m_in.m_lc_pm_time.sec, m_in.m_lc_pm_time.nsec);
+		return(s);
+	case CLOCK_MONOTONIC: /* monotonic cannot be changed */
+	default:
+		return EINVAL; /* invalid/unsupported clock_id */
+  }
 }
 
-int do_time(void)
+/*===========================================================================*
+ *				do_time					     *
+ *===========================================================================*/
+int
+do_time(void)
 {
+/* Perform the time(tp) system call. */
   struct timespec tv;
 
-  clock_time(&tv);
+  (void)clock_time(&tv);
 
   mp->mp_reply.m_pm_lc_time.sec = tv.tv_sec;
   mp->mp_reply.m_pm_lc_time.nsec = tv.tv_nsec;
-  return OK;
+  return(OK);
 }
 
-int do_stime(void)
+/*===========================================================================*
+ *				do_stime				     *
+ *===========================================================================*/
+int
+do_stime(void)
 {
-  clock_t realtime;
+/* Perform the stime(tp) system call. Retrieve the system's uptime (ticks
+ * since boot) and pass the new time in seconds at system boot to the kernel.
+ */
+  clock_t uptime, realtime;
   time_t boottime;
+  int s;
 
-  if (mp->mp_effuid != SUPER_USER)
-      return EPERM;
+  if (mp->mp_effuid != SUPER_USER) {
+      return(EPERM);
+  }
+  if ( (s=getuptime(&uptime, &realtime, &boottime)) != OK)
+      panic("do_stime couldn't get uptime: %d", s);
+  boottime = m_in.m_lc_pm_time.sec - (realtime/system_hz);
 
-  if (getuptime(NULL, &realtime, &boottime) != OK)
-      panic("do_stime couldn't get uptime");
+  s= sys_stime(boottime);		/* Tell kernel about boottime */
+  if (s != OK)
+	panic("pm: sys_stime failed: %d", s);
 
-  boottime = m_in.m_lc_pm_time.sec - (realtime / system_hz);
-
-  if (sys_stime(boottime) != OK)
-      panic("pm: sys_stime failed");
-
-  return OK;
+  return(OK);
 }
