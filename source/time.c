@@ -15,20 +15,19 @@
 #include <sys/time.h>
 #include "mproc.h"
 
-/*===========================================================================*
- *				do_gettime				     *
- *===========================================================================*/
-int
-do_gettime(void)
+#define NSEC_PER_SEC 1000000000ULL
+
+static int get_timespec(clockid_t clk_id, struct timespec *tv)
 {
-  clock_t ticks, realtime, clock;
-  time_t boottime;
-  int s;
+	clock_t ticks, realtime, clock;
+	time_t boottime;
+	int s;
 
-  if ( (s=getuptime(&ticks, &realtime, &boottime)) != OK)
-  	panic("do_time couldn't get uptime: %d", s);
+	if ((s = getuptime(&ticks, &realtime, &boottime)) != OK) {
+		return s;
+	}
 
-  switch (m_in.m_lc_pm_time.clk_id) {
+	switch (clk_id) {
 	case CLOCK_REALTIME:
 		clock = realtime;
 		break;
@@ -36,96 +35,85 @@ do_gettime(void)
 		clock = ticks;
 		break;
 	default:
-		return EINVAL; /* invalid/unsupported clock_id */
-  }
+		return EINVAL;
+	}
 
-  mp->mp_reply.m_pm_lc_time.sec = boottime + (clock / system_hz);
-  mp->mp_reply.m_pm_lc_time.nsec =
-	(uint32_t) ((clock % system_hz) * 1000000000ULL / system_hz);
+	tv->tv_sec = boottime + (clock / system_hz);
+	tv->tv_nsec = (long)((clock % system_hz) * NSEC_PER_SEC / system_hz);
 
-  return(OK);
+	return OK;
 }
 
-/*===========================================================================*
- *				do_getres				     *
- *===========================================================================*/
-int
-do_getres(void)
+int do_gettime(void)
 {
-  switch (m_in.m_lc_pm_time.clk_id) {
+	struct timespec ts;
+	int r;
+
+	r = get_timespec(m_in.m_lc_pm_time.clk_id, &ts);
+	if (r == OK) {
+		mp->mp_reply.m_pm_lc_time.sec = ts.tv_sec;
+		mp->mp_reply.m_pm_lc_time.nsec = (uint32_t)ts.tv_nsec;
+	}
+	return r;
+}
+
+int do_getres(void)
+{
+	switch (m_in.m_lc_pm_time.clk_id) {
 	case CLOCK_REALTIME:
 	case CLOCK_MONOTONIC:
-		/* tv_sec is always 0 since system_hz is an int */
 		mp->mp_reply.m_pm_lc_time.sec = 0;
-		mp->mp_reply.m_pm_lc_time.nsec = 1000000000 / system_hz;
-		return(OK);
+		mp->mp_reply.m_pm_lc_time.nsec = NSEC_PER_SEC / system_hz;
+		return OK;
 	default:
-		return EINVAL; /* invalid/unsupported clock_id */
-  }
+		return EINVAL;
+	}
 }
 
-/*===========================================================================*
- *				do_settime				     *
- *===========================================================================*/
-int
-do_settime(void)
+int do_settime(void)
 {
-  int s;
+	if (mp->mp_effuid != SUPER_USER) {
+		return EPERM;
+	}
 
-  if (mp->mp_effuid != SUPER_USER) {
-      return(EPERM);
-  }
-
-  switch (m_in.m_lc_pm_time.clk_id) {
+	switch (m_in.m_lc_pm_time.clk_id) {
 	case CLOCK_REALTIME:
-		s = sys_settime(m_in.m_lc_pm_time.now, m_in.m_lc_pm_time.clk_id,
+		return sys_settime(m_in.m_lc_pm_time.now, m_in.m_lc_pm_time.clk_id,
 			m_in.m_lc_pm_time.sec, m_in.m_lc_pm_time.nsec);
-		return(s);
-	case CLOCK_MONOTONIC: /* monotonic cannot be changed */
+	case CLOCK_MONOTONIC:
 	default:
-		return EINVAL; /* invalid/unsupported clock_id */
-  }
+		return EINVAL;
+	}
 }
 
-/*===========================================================================*
- *				do_time					     *
- *===========================================================================*/
-int
-do_time(void)
+int do_time(void)
 {
-/* Perform the time(tp) system call. */
-  struct timespec tv;
+	struct timespec ts;
+	int r;
 
-  (void)clock_time(&tv);
-
-  mp->mp_reply.m_pm_lc_time.sec = tv.tv_sec;
-  mp->mp_reply.m_pm_lc_time.nsec = tv.tv_nsec;
-  return(OK);
+	r = get_timespec(CLOCK_REALTIME, &ts);
+	if (r == OK) {
+		mp->mp_reply.m_pm_lc_time.sec = ts.tv_sec;
+		mp->mp_reply.m_pm_lc_time.nsec = (uint32_t)ts.tv_nsec;
+	}
+	return r;
 }
 
-/*===========================================================================*
- *				do_stime				     *
- *===========================================================================*/
-int
-do_stime(void)
+int do_stime(void)
 {
-/* Perform the stime(tp) system call. Retrieve the system's uptime (ticks
- * since boot) and pass the new time in seconds at system boot to the kernel.
- */
-  clock_t uptime, realtime;
-  time_t boottime;
-  int s;
+	clock_t realtime;
+	time_t boottime;
+	int s;
 
-  if (mp->mp_effuid != SUPER_USER) {
-      return(EPERM);
-  }
-  if ( (s=getuptime(&uptime, &realtime, &boottime)) != OK)
-      panic("do_stime couldn't get uptime: %d", s);
-  boottime = m_in.m_lc_pm_time.sec - (realtime/system_hz);
+	if (mp->mp_effuid != SUPER_USER) {
+		return EPERM;
+	}
 
-  s= sys_stime(boottime);		/* Tell kernel about boottime */
-  if (s != OK)
-	panic("pm: sys_stime failed: %d", s);
+	if ((s = getuptime(NULL, &realtime, &boottime)) != OK) {
+		return s;
+	}
 
-  return(OK);
+	boottime = m_in.m_lc_pm_time.sec - (realtime / system_hz);
+
+	return sys_stime(boottime);
 }
