@@ -1,1 +1,0 @@
-# minix-servers-pm-time
